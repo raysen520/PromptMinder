@@ -1,0 +1,1082 @@
+"use client";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import Link from "next/link";
+import dynamic from "next/dynamic";
+import { useRouter } from "next/navigation";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Pagination } from "@/components/ui/pagination";
+import { useToast } from "@/hooks/use-toast";
+import { useLanguage } from "@/contexts/LanguageContext";
+import { useTeam } from "@/contexts/team-context";
+import { useUser } from "@clerk/nextjs";
+import * as VisuallyHidden from "@radix-ui/react-visually-hidden";
+import { apiClient } from "@/lib/api-client";
+import { useClipboard } from "@/lib/clipboard";
+import { debounce } from "@/lib/debounce-utils";
+import { PromptGrid, PromptGridSkeleton } from "@/components/prompt/PromptGrid";
+import { NewPromptDialog } from "@/components/prompt/NewPromptDialog";
+import { OptimizePromptDialog } from "@/components/prompt/OptimizePromptDialog";
+import { OnboardingDialog } from "@/components/prompt/OnboardingDialog";
+import { Search, Tags, ChevronDown, Heart, PlusCircle } from "lucide-react";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+
+const TagFilter = dynamic(() => import("@/components/prompt/TagFilter"), {
+  loading: () => <Skeleton className="h-10 w-32" />,
+  ssr: false,
+});
+
+const ONBOARDING_STORAGE_PREFIX = "promptminder:onboarding:v1";
+const DEFAULT_PROMPT_VERSION = "1.0.0";
+const DEFAULT_PROMPT_TAGS = "Chatbot";
+const DEFAULT_PAGINATION = {
+  page: 1,
+  limit: 20,
+  total: 0,
+  totalPages: 0,
+};
+const DEFAULT_NEW_PROMPT = {
+  title: "",
+  content: "",
+  description: "",
+  tags: DEFAULT_PROMPT_TAGS,
+  version: DEFAULT_PROMPT_VERSION,
+  cover_img: "",
+};
+
+function normalizePrompt(prompt) {
+  return {
+    ...prompt,
+    version: prompt.version || "1.0",
+    cover_img: prompt.cover_img || "/default-cover.jpg",
+    tags: Array.isArray(prompt.tags)
+      ? prompt.tags
+      : (prompt.tags || "").split(",").filter(Boolean),
+  };
+}
+
+function groupPromptsByTitle(promptList) {
+  const groups = promptList.reduce((acc, prompt) => {
+    const groupKey = prompt.lineage_id || prompt.title || "Untitled";
+    if (!acc[groupKey]) {
+      acc[groupKey] = [];
+    }
+    acc[groupKey].push(prompt);
+    return acc;
+  }, {});
+
+  return Object.entries(groups).map(([, versions]) => ({
+    title: versions[0]?.title || "Untitled",
+    versions: [...versions].sort(
+      (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+    ),
+  }));
+}
+
+function getTeamRequestOptions(activeTeamId) {
+  return activeTeamId ? { teamId: activeTeamId } : {};
+}
+
+export default function PromptsPage() {
+  const { t } = useLanguage();
+  const { user } = useUser();
+  const { activeTeamId, isPersonal, activeMembership } = useTeam();
+  const { toast } = useToast();
+  const { copy } = useClipboard();
+  const router = useRouter();
+  const [prompts, setPrompts] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [selectedTags, setSelectedTags] = useState([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [promptToDelete, setPromptToDelete] = useState(null);
+  const [selectedVersions, setSelectedVersions] = useState(null);
+  const [showNewPromptDialog, setShowNewPromptDialog] = useState(false);
+  const [showOnboardingDialog, setShowOnboardingDialog] = useState(false);
+  const [isImportingConversation, setIsImportingConversation] = useState(false);
+  const [showOptimizeModal, setShowOptimizeModal] = useState(false);
+  const [optimizedContent, setOptimizedContent] = useState("");
+  const [isOptimizing, setIsOptimizing] = useState(false);
+  const [newPrompt, setNewPrompt] = useState({ ...DEFAULT_NEW_PROMPT });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [tagOptions, setTagOptions] = useState([]);
+  const [activeTab, setActiveTab] = useState("all");
+  const [favoriteStatus, setFavoriteStatus] = useState({});
+  const [favorites, setFavorites] = useState([]);
+  const [favoritesLoading, setFavoritesLoading] = useState(false);
+  const [favoritesPagination, setFavoritesPagination] = useState({
+    ...DEFAULT_PAGINATION,
+  });
+  
+  // 分页相关状态
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
+  const [pagination, setPagination] = useState({ ...DEFAULT_PAGINATION });
+
+  // Optimize debounced search with proper cleanup
+  const debouncedSearch = useMemo(
+    () =>
+      debounce((value) => {
+        setSearchQuery(value);
+        setCurrentPage(1);
+      }, 300),
+    []
+  );
+
+  useEffect(() => {
+    return () => {
+      if (typeof debouncedSearch.cancel === "function") {
+        debouncedSearch.cancel();
+      }
+    };
+  }, [debouncedSearch]);
+
+  // 获取prompts数据的函数
+  const fetchPrompts = useCallback(async () => {
+    try {
+      setIsLoading(true);
+      const params = {
+        page: currentPage,
+        limit: pageSize,
+      };
+
+      if (selectedTags.length > 0) {
+        params.tag = selectedTags[0];
+      }
+
+      if (searchQuery.trim()) {
+        params.search = searchQuery.trim();
+      }
+
+      const data = await apiClient.getPrompts(
+        params,
+        getTeamRequestOptions(activeTeamId)
+      );
+
+      if (data.prompts) {
+        setPrompts(data.prompts.map(normalizePrompt));
+        setPagination(data.pagination);
+      } else {
+        setPrompts(data.map(normalizePrompt));
+      }
+    } catch (error) {
+      console.error("Error fetching prompts:", error);
+      toast({
+        title: "获取失败",
+        description: error.message || "无法获取提示词列表",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  }, [activeTeamId, currentPage, pageSize, searchQuery, selectedTags, toast]);
+
+  // Memoize event handlers to prevent unnecessary re-renders
+  const handleCopy = useCallback(async (content) => {
+    await copy(content);
+  }, [copy]);
+
+  const handleDelete = useCallback((id) => {
+    setPromptToDelete(id);
+    setDeleteDialogOpen(true);
+  }, []);
+
+  const confirmDelete = useCallback(async () => {
+    if (!t?.promptsPage) return;
+    
+    try {
+      await apiClient.deletePrompt(
+        promptToDelete,
+        getTeamRequestOptions(activeTeamId)
+      );
+      fetchPrompts();
+      setDeleteDialogOpen(false);
+      toast({
+        description: t.promptsPage.deleteSuccess,
+        duration: 2000,
+      });
+    } catch (error) {
+      console.error("Error deleting prompt:", error);
+      toast({
+        variant: "destructive",
+        description: error.message || t.promptsPage.deleteError,
+        duration: 2000,
+      });
+    }
+  }, [promptToDelete, toast, t?.promptsPage, fetchPrompts, activeTeamId]);
+
+  // 分页处理函数
+  const handlePageChange = useCallback((page) => {
+    setCurrentPage(page);
+  }, []);
+
+  const handlePageSizeChange = useCallback((size) => {
+    setPageSize(size);
+    setCurrentPage(1);
+  }, []);
+
+  // Memoize tag extraction to avoid recalculating on every render
+  const allTags = useMemo(() => {
+    return [
+      ...new Set(
+        prompts.flatMap((prompt) =>
+          Array.isArray(prompt.tags) ? prompt.tags : []
+        )
+      ),
+    ];
+  }, [prompts]);
+
+  const handleShare = useCallback(async (id) => {
+    if (!t?.promptsPage) return;
+    
+    try {
+      await apiClient.sharePrompt(id, getTeamRequestOptions(activeTeamId));
+      const shareUrl = `${window.location.origin}/share/${id}`;
+      await copy(shareUrl);
+    } catch (error) {
+      console.error("Error sharing prompt:", error);
+      toast({
+        variant: "destructive",
+        description: error.message || t.promptsPage.shareError,
+        duration: 2000,
+      });
+    }
+  }, [copy, toast, t?.promptsPage, activeTeamId]);
+
+  // Group prompts by lineage (fallback to title) for version rendering
+  const groupedPrompts = useMemo(() => {
+    return groupPromptsByTitle(prompts);
+  }, [prompts]);
+
+  const showVersions = useCallback((versions) => {
+    setSelectedVersions(versions);
+  }, []);
+
+  const handleOpenPrompt = useCallback(
+    (id) => {
+      router.push(`/prompts/${id}`);
+    },
+    [router]
+  );
+
+  const handleCreateNewVersion = useCallback(() => {
+    if (selectedVersions?.length) {
+      const latest = selectedVersions[0];
+      router.push(`/prompts/${latest.id}/edit`);
+    }
+  }, [router, selectedVersions]);
+
+  const handleCreatePrompt = useCallback(async () => {
+    if (!t?.promptsPage) return;
+    if (!newPrompt.title.trim() || !newPrompt.content.trim()) {
+      toast({
+        variant: "destructive",
+        description: t.promptsPage.createValidation,
+        duration: 2000,
+      });
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const result = await apiClient.createPrompt(
+        {
+          ...newPrompt,
+          id: crypto.randomUUID(),
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          is_public: true,
+        },
+        getTeamRequestOptions(activeTeamId)
+      );
+
+      if (result?.mode === "approval_required" && result?.change_request?.id) {
+        setShowNewPromptDialog(false);
+        toast({
+          description: t.promptsPage.createPendingApproval || "已提交审批请求",
+          duration: 2000,
+        });
+        router.push(`/prompts/reviews/${result.change_request.id}`);
+      } else {
+        fetchPrompts();
+
+        setShowNewPromptDialog(false);
+        setNewPrompt({ ...DEFAULT_NEW_PROMPT });
+
+        toast({
+          description: t.promptsPage.createSuccess,
+          duration: 2000,
+        });
+      }
+    } catch (error) {
+      console.error("Error creating prompt:", error);
+      toast({
+        variant: "destructive",
+        description: error.message || t.promptsPage.createError,
+        duration: 2000,
+      });
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [newPrompt, toast, t?.promptsPage, fetchPrompts, activeTeamId, router]);
+
+  const markOnboardingCompleted = useCallback(() => {
+    if (typeof window === "undefined" || !user?.id) {
+      return;
+    }
+
+    window.localStorage.setItem(
+      `${ONBOARDING_STORAGE_PREFIX}:${user.id}`,
+      "done"
+    );
+  }, [user?.id]);
+
+  const handleOnboardingOpenChange = useCallback(
+    (open) => {
+      setShowOnboardingDialog(open);
+      if (!open) {
+        markOnboardingCompleted();
+      }
+    },
+    [markOnboardingCompleted]
+  );
+
+  const handleApplyRoleTemplate = useCallback(
+    (roleTemplate) => {
+      const tags = Array.isArray(roleTemplate?.tags)
+        ? roleTemplate.tags.join(",")
+        : roleTemplate?.tags || "Chatbot";
+
+      setNewPrompt({
+        title: roleTemplate?.promptTitle || roleTemplate?.title || "",
+        content: roleTemplate?.promptContent || "",
+        description: roleTemplate?.promptDescription || roleTemplate?.description || "",
+        tags,
+        version: DEFAULT_PROMPT_VERSION,
+        cover_img: DEFAULT_NEW_PROMPT.cover_img,
+      });
+
+      setShowOnboardingDialog(false);
+      markOnboardingCompleted();
+      setShowNewPromptDialog(true);
+    },
+    [markOnboardingCompleted]
+  );
+
+  const handleImportConversation = useCallback(
+    async ({ source, conversation }) => {
+      if (!conversation?.trim() || conversation.trim().length < 20) {
+        toast({
+          variant: "destructive",
+          description:
+            t?.promptsPage?.onboarding?.validationConversation ||
+            "请先粘贴至少 20 个字符的对话内容",
+          duration: 2000,
+        });
+        return;
+      }
+
+      setIsImportingConversation(true);
+      try {
+        const data = await apiClient.importConversationToPrompt({
+          source,
+          conversation,
+        });
+
+        setNewPrompt({
+          title: data?.title || "",
+          content: data?.content || "",
+          description: data?.description || "",
+          tags: data?.tags || DEFAULT_PROMPT_TAGS,
+          version: data?.version || DEFAULT_PROMPT_VERSION,
+          cover_img: DEFAULT_NEW_PROMPT.cover_img,
+        });
+
+        setShowOnboardingDialog(false);
+        markOnboardingCompleted();
+        setShowNewPromptDialog(true);
+
+        toast({
+          description:
+            t?.promptsPage?.onboarding?.importSuccess ||
+            "已根据对话生成提示词草稿",
+          duration: 2000,
+        });
+      } catch (error) {
+        console.error("Error importing conversation:", error);
+        toast({
+          variant: "destructive",
+          description:
+            error.message ||
+            t?.promptsPage?.onboarding?.importError ||
+            "导入失败，请稍后重试",
+          duration: 2000,
+        });
+      } finally {
+        setIsImportingConversation(false);
+      }
+    },
+    [markOnboardingCompleted, t?.promptsPage?.onboarding, toast]
+  );
+
+  const handleCreateTag = useCallback(async (inputValue) => {
+    try {
+      await apiClient.createTag(
+        { name: inputValue, scope: activeTeamId ? 'team' : 'personal' },
+        getTeamRequestOptions(activeTeamId)
+      );
+      const newOption = { value: inputValue, label: inputValue };
+      setTagOptions((prev) => [...prev, newOption]);
+      return newOption;
+    } catch (error) {
+      console.error("Error creating new tag:", error);
+      toast({
+        variant: "destructive",
+        description: error.message || "创建标签失败",
+        duration: 2000,
+      });
+    }
+    return null;
+  }, [toast, activeTeamId]);
+
+  const updateNewPromptField = useCallback((field, value) => {
+    setNewPrompt((prev) => ({ ...prev, [field]: value }));
+  }, []);
+
+  const handleOptimize = useCallback(async () => {
+    if (!newPrompt.content.trim() || !t?.promptsPage) return;
+    setIsOptimizing(true);
+    setOptimizedContent("");
+    setShowOptimizeModal(true);
+
+    try {
+      const response = await apiClient.generate(newPrompt.content);
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let tempContent = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split("\n").filter((line) => line.trim());
+
+        for (const line of lines) {
+          try {
+            const jsonStr = line.replace(/^data: /, "").trim();
+            if (!jsonStr || jsonStr === "[DONE]") continue;
+
+            const data = JSON.parse(jsonStr);
+            if (data.choices?.[0]?.delta?.content) {
+              tempContent += data.choices[0].delta.content;
+              setOptimizedContent(tempContent);
+            }
+          } catch (e) {
+            console.error(t.promptsPage.optimizeParsingError, e);
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Optimization error:", error);
+      toast({
+        variant: "destructive",
+        description: error.message || t.promptsPage.optimizeRetry,
+        duration: 2000,
+      });
+    } finally {
+      setIsOptimizing(false);
+    }
+  }, [newPrompt.content, t?.promptsPage, toast]);
+
+  const applyOptimizedContent = useCallback(() => {
+    setNewPrompt((prev) => ({ ...prev, content: optimizedContent }));
+    setOptimizedContent("");
+    setShowOptimizeModal(false);
+  }, [optimizedContent]);
+
+  const fetchFavorites = useCallback(async () => {
+    try {
+      setFavoritesLoading(true);
+      const data = await apiClient.getFavorites({
+        page: favoritesPagination.page,
+        limit: favoritesPagination.limit
+      });
+
+      if (data.prompts) {
+        setFavorites(data.prompts.map(normalizePrompt));
+        setFavoritesPagination(data.pagination);
+      }
+    } catch (error) {
+      console.error("Error fetching favorites:", error);
+    } finally {
+      setFavoritesLoading(false);
+    }
+  }, [favoritesPagination.page, favoritesPagination.limit]);
+
+  const checkFavoriteStatus = useCallback(async (promptIds) => {
+    if (!promptIds || promptIds.length === 0) return;
+    try {
+      const { favorites } = await apiClient.checkFavorites(promptIds);
+      setFavoriteStatus(prev => ({ ...prev, ...favorites }));
+    } catch (error) {
+      console.error("Error checking favorites:", error);
+    }
+  }, []);
+
+  const handleToggleFavorite = useCallback(async (promptId, currentStatus) => {
+    if (!t?.favorites) return;
+    
+    const newStatus = !currentStatus;
+    
+    setFavoriteStatus(prev => ({ ...prev, [promptId]: newStatus }));
+    
+    let removedPrompt = null;
+    let removedIndex = -1;
+    if (currentStatus && activeTab === "favorites") {
+      removedIndex = favorites.findIndex(p => p.id === promptId);
+      if (removedIndex !== -1) {
+        removedPrompt = favorites[removedIndex];
+      }
+      setFavorites(prev => prev.filter(p => p.id !== promptId));
+      setFavoritesPagination(prev => ({ ...prev, total: Math.max(0, prev.total - 1) }));
+    }
+    
+    try {
+      if (currentStatus) {
+        await apiClient.removeFavorite(promptId);
+        toast({
+          description: t.favorites.removeSuccess,
+          duration: 2000,
+        });
+      } else {
+        await apiClient.addFavorite(promptId);
+        toast({
+          description: t.favorites.addSuccess,
+          duration: 2000,
+        });
+      }
+    } catch (error) {
+      console.error("Error toggling favorite:", error);
+      
+      setFavoriteStatus(prev => ({ ...prev, [promptId]: currentStatus }));
+      
+      if (removedPrompt && activeTab === "favorites") {
+        setFavorites(prev => {
+          const newFavorites = [...prev];
+          newFavorites.splice(removedIndex, 0, removedPrompt);
+          return newFavorites;
+        });
+        setFavoritesPagination(prev => ({ ...prev, total: prev.total + 1 }));
+      }
+      
+      toast({
+        variant: "destructive",
+        description: currentStatus ? t.favorites.removeError : t.favorites.addError,
+        duration: 2000,
+      });
+    }
+  }, [toast, t?.favorites, activeTab, favorites]);
+
+  const handleToggleSubscription = useCallback(async (promptId, currentStatus) => {
+    if (!activeTeamId) {
+      toast({
+        variant: "destructive",
+        description: t?.promptsPage?.subscriptionTeamOnly || "仅团队空间支持订阅",
+        duration: 2000,
+      });
+      return;
+    }
+
+    setPrompts((prev) =>
+      prev.map((item) =>
+        item.id === promptId ? { ...item, is_subscribed: !currentStatus } : item
+      )
+    );
+    setFavorites((prev) =>
+      prev.map((item) =>
+        item.id === promptId ? { ...item, is_subscribed: !currentStatus } : item
+      )
+    );
+
+    try {
+      if (currentStatus) {
+        await apiClient.unsubscribePrompt(promptId, { teamId: activeTeamId });
+        toast({
+          description: t?.promptsPage?.unsubscribeSuccess || "已取消订阅",
+          duration: 2000,
+        });
+      } else {
+        await apiClient.subscribePrompt(promptId, { teamId: activeTeamId });
+        toast({
+          description: t?.promptsPage?.subscribeSuccess || "已订阅变更通知",
+          duration: 2000,
+        });
+      }
+    } catch (error) {
+      console.error("Error toggling subscription:", error);
+      setPrompts((prev) =>
+        prev.map((item) =>
+          item.id === promptId ? { ...item, is_subscribed: currentStatus } : item
+        )
+      );
+      setFavorites((prev) =>
+        prev.map((item) =>
+          item.id === promptId ? { ...item, is_subscribed: currentStatus } : item
+        )
+      );
+      toast({
+        variant: "destructive",
+        description:
+          error.message ||
+          (currentStatus
+            ? t?.promptsPage?.unsubscribeError || "取消订阅失败"
+            : t?.promptsPage?.subscribeError || "订阅失败"),
+        duration: 2000,
+      });
+    }
+  }, [activeTeamId, t?.promptsPage, toast]);
+
+  const handleTabChange = useCallback((value) => {
+    setActiveTab(value);
+  }, []);
+
+  useEffect(() => {
+    fetchPrompts();
+  }, [fetchPrompts]);
+
+  useEffect(() => {
+    if (activeTab === "favorites") {
+      fetchFavorites();
+    }
+  }, [activeTab, fetchFavorites]);
+
+  useEffect(() => {
+    if (prompts.length > 0) {
+      const promptIds = prompts.map(p => p.id);
+      checkFavoriteStatus(promptIds);
+    }
+  }, [prompts, checkFavoriteStatus]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [selectedTags, activeTeamId]);
+
+  useEffect(() => {
+    const fetchTags = async () => {
+      try {
+        const data = await apiClient.getTags(getTeamRequestOptions(activeTeamId));
+
+        let combinedTags = [];
+        
+        if (data?.team || data?.personal || data?.public) {
+          // 新的结构化响应：合并团队/个人标签和公共标签
+          combinedTags = [
+            ...(data.team || []),
+            ...(data.personal || []),
+            ...(data.public || []),
+          ];
+        } else if (Array.isArray(data)) {
+          // 旧版数组响应
+          combinedTags = data;
+        }
+
+        // 去重（基于标签名称）
+        const uniqueTags = Array.from(
+          new Map(combinedTags.map((tag) => [tag.name, tag])).values()
+        );
+
+        const mappedTags = uniqueTags.map((tag) => ({
+          value: tag.name,
+          label: tag.name,
+        }));
+        
+        setTagOptions(mappedTags);
+      } catch (error) {
+        console.error("Error fetching tags:", error);
+        toast({
+          title: "获取标签失败",
+          description: error.message || "无法获取标签列表",
+          variant: "destructive",
+        });
+      }
+    };
+
+    fetchTags();
+  }, [toast, activeTeamId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !user?.id || isLoading) {
+      return;
+    }
+    if (activeTab !== "all") {
+      return;
+    }
+    if (searchQuery.trim() || selectedTags.length > 0) {
+      return;
+    }
+    if ((pagination?.total || 0) > 0) {
+      return;
+    }
+
+    const key = `${ONBOARDING_STORAGE_PREFIX}:${user.id}`;
+    const onboardingState = window.localStorage.getItem(key);
+    if (onboardingState !== "done") {
+      setShowOnboardingDialog(true);
+    }
+  }, [
+    activeTab,
+    isLoading,
+    pagination?.total,
+    searchQuery,
+    selectedTags,
+    user?.id,
+  ]);
+
+  if (!t) return null;
+  const tp = t.promptsPage;
+  const groupedFavorites = useMemo(() => {
+    return groupPromptsByTitle(favorites);
+  }, [favorites]);
+  const favoriteMapInFavoritesTab = useMemo(() => {
+    return favorites.reduce((acc, prompt) => {
+      acc[prompt.id] = true;
+      return acc;
+    }, {});
+  }, [favorites]);
+
+  return (
+    <div className="min-h-[80vh] bg-white pb-24 sm:pb-0">
+      <div className="container px-4 py-6 sm:py-12 mx-auto max-w-7xl">
+        <div className="space-y-6 sm:space-y-8">
+          <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full space-y-6 sm:space-y-8">
+            <div className="flex flex-col space-y-6">
+              <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4">
+                <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">{tp.title}</h1>
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="flex items-center gap-2 px-4 py-2 bg-secondary/30 rounded-lg">
+                    <span className="text-sm font-medium text-secondary-foreground">
+                      {tp.totalPrompts.replace(
+                        "{count}",
+                        pagination.total.toString()
+                      )}
+                    </span>
+                  </div>
+                  {!isPersonal && activeTeamId && (
+                    <Button asChild variant="outline" className="whitespace-nowrap">
+                      <Link href="/teams">{tp.manageTeam}</Link>
+                    </Button>
+                  )}
+                  {!isPersonal && activeTeamId && (
+                    <Button asChild variant="outline" className="whitespace-nowrap">
+                      <Link href="/prompts/reviews">{tp.reviewCenter || "审批工作台"}</Link>
+                    </Button>
+                  )}
+                  {!isLoading && pagination.total === 0 && (
+                    <Button
+                      variant="outline"
+                      onClick={() => setShowOnboardingDialog(true)}
+                      className="whitespace-nowrap"
+                    >
+                      {tp?.onboarding?.trigger || "首次引导"}
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-3 sm:gap-4 lg:flex-row lg:items-center justify-between">
+                <div className="relative w-full sm:w-[320px]">
+                  <div className="absolute left-3 top-1/2 transform -translate-y-1/2 text-muted-foreground">
+                    <Search className="h-4 w-4" />
+                  </div>
+                  <Input
+                    type="search"
+                    onChange={(e) => debouncedSearch(e.target.value)}
+                    placeholder={tp.searchPlaceholder}
+                    className="w-full h-11 pl-9 pr-4 transition-all duration-200 ease-in-out border rounded-lg focus-visible:ring-2 focus-visible:ring-primary/30 focus-visible:border-primary"
+                  />
+                </div>
+
+                <TabsList className="h-11 w-full sm:w-auto p-1 bg-secondary/20 grid grid-cols-2 sm:inline-flex">
+                  <TabsTrigger value="all" className="gap-2 h-9">
+                    <Tags className="h-3.5 w-3.5" />
+                    <span className="text-sm font-medium">{tp.title}</span>
+                  </TabsTrigger>
+                  <TabsTrigger value="favorites" className="gap-2 h-9">
+                    <Heart className="h-3.5 w-3.5" />
+                    <span className="text-sm font-medium">{t.favorites?.title || "收藏夹"}</span>
+                  </TabsTrigger>
+                </TabsList>
+              </div>
+
+              {!isLoading && (
+                <div className="flex flex-col gap-3 md:flex-row md:items-center md:gap-4">
+                  <TagFilter
+                    allTags={allTags}
+                    selectedTags={selectedTags}
+                    onTagSelect={setSelectedTags}
+                    className="touch-manipulation w-full md:w-auto"
+                    t={t}
+                  />
+                  <Button
+                    asChild
+                    variant="outline"
+                    className="group h-9 px-2.5 self-stretch sm:self-start md:self-auto md:h-8 md:px-2"
+                  >
+                    <Link href="/tags">
+                      <Tags className="mr-2 h-3.5 w-3.5 md:h-3 md:w-3 group-hover:text-primary transition-colors" />
+                      <span className="text-xs md:text-[11px] group-hover:text-primary transition-colors">
+                        {tp.manageTags}
+                      </span>
+                    </Link>
+                  </Button>
+                </div>
+              )}
+            </div>
+
+            <div className="w-full">
+              {activeTab === "all" && (
+                <>
+                  {isLoading ? (
+                    <div className="mt-8">
+                      <PromptGridSkeleton />
+                    </div>
+                  ) : (
+                    <>
+                      <PromptGrid
+                        groups={groupedPrompts}
+                        onCreatePrompt={() => setShowNewPromptDialog(true)}
+                        onCopyPrompt={handleCopy}
+                        onSharePrompt={handleShare}
+                        onDeletePrompt={handleDelete}
+                        onOpenVersions={showVersions}
+                        onOpenPrompt={handleOpenPrompt}
+                        onToggleFavorite={handleToggleFavorite}
+                        onToggleSubscription={handleToggleSubscription}
+                        favoriteStatus={favoriteStatus}
+                        translations={t}
+                        user={user}
+                        role={activeMembership?.role}
+                        isPersonal={isPersonal}
+                      />
+
+                      {pagination.totalPages > 1 && (
+                        <div className="mt-6 sm:mt-8 flex justify-center">
+                          <Pagination
+                            currentPage={pagination.page}
+                            totalPages={pagination.totalPages}
+                            total={pagination.total}
+                            pageSize={pagination.limit}
+                            onPageChange={handlePageChange}
+                            onPageSizeChange={handlePageSizeChange}
+                            showSizeChanger={true}
+                            pageSizeOptions={[10, 20, 50]}
+                            className="w-full"
+                            t={t}
+                          />
+                        </div>
+                      )}
+                    </>
+                  )}
+                </>
+              )}
+
+            {activeTab === "favorites" && (
+              <>
+                {favoritesLoading ? (
+                  <div className="mt-8">
+                    <PromptGridSkeleton />
+                  </div>
+                ) : favorites.length === 0 ? (
+                  <div className="mt-8 flex flex-col items-center justify-center py-16 text-center">
+                    <div className="bg-secondary/30 p-4 rounded-full mb-4">
+                      <Heart className="h-12 w-12 text-muted-foreground" />
+                    </div>
+                    <h3 className="text-lg font-medium text-foreground mb-2">
+                      {t.favorites?.empty || "暂无收藏的提示词"}
+                    </h3>
+                    <p className="text-sm text-muted-foreground max-w-md">
+                      {t.favorites?.emptyDescription || "点击提示词卡片上的收藏按钮来收藏喜欢的提示词"}
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <PromptGrid
+                      groups={groupedFavorites}
+                      onCreatePrompt={() => setShowNewPromptDialog(true)}
+                      onCopyPrompt={handleCopy}
+                      onSharePrompt={handleShare}
+                      onDeletePrompt={handleDelete}
+                      onOpenVersions={showVersions}
+                      onOpenPrompt={handleOpenPrompt}
+                      onToggleFavorite={handleToggleFavorite}
+                      onToggleSubscription={handleToggleSubscription}
+                      favoriteStatus={favoriteMapInFavoritesTab}
+                      translations={t}
+                      user={user}
+                      role={activeMembership?.role}
+                      isPersonal={isPersonal}
+                    />
+
+                    {favoritesPagination.totalPages > 1 && (
+                      <div className="mt-6 sm:mt-8 flex justify-center">
+                        <Pagination
+                          currentPage={favoritesPagination.page}
+                          totalPages={favoritesPagination.totalPages}
+                          total={favoritesPagination.total}
+                          pageSize={favoritesPagination.limit}
+                          onPageChange={(page) => setFavoritesPagination(prev => ({ ...prev, page }))}
+                          onPageSizeChange={(size) => setFavoritesPagination(prev => ({ ...prev, limit: size, page: 1 }))}
+                          showSizeChanger={true}
+                          pageSizeOptions={[10, 20, 50]}
+                          className="w-full"
+                          t={t}
+                        />
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+            </div>
+          </Tabs>
+        </div>
+      <Dialog
+        open={!!selectedVersions}
+        onOpenChange={() => setSelectedVersions(null)}
+      >
+        <DialogContent className="w-[calc(100vw-1.5rem)] max-w-md sm:max-w-md">
+          <VisuallyHidden.Root>
+            <DialogTitle>Dialog</DialogTitle>
+          </VisuallyHidden.Root>
+          <DialogHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <DialogTitle className="text-xl">
+              {tp.versionHistoryTitle}
+            </DialogTitle>
+            <Button onClick={handleCreateNewVersion} className="h-10 w-full sm:w-auto sm:h-9">
+              {tp.createNewVersion}
+            </Button>
+          </DialogHeader>
+          <div className="space-y-3 mt-4 max-h-[60vh] overflow-y-auto pr-1">
+            {selectedVersions?.map((version) => (
+              <Link
+                key={version.id}
+                href={`/prompts/${version.id}`}
+                className="block"
+              >
+                <Card className="p-4 hover:bg-accent/50 cursor-pointer transition-colors border border-border/50 hover:border-primary/30">
+                  <div className="flex justify-between items-center">
+                    <div>
+                      <div className="font-medium text-primary">
+                        v{version.version}
+                      </div>
+                      <div className="text-sm text-muted-foreground">
+                        {new Date(version.created_at).toLocaleString()}
+                      </div>
+                    </div>
+                    <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                  </div>
+                </Card>
+              </Link>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+        <DialogContent className="w-[calc(100vw-1.5rem)] max-w-md sm:max-w-md">
+          <VisuallyHidden.Root>
+            <DialogTitle>Dialog</DialogTitle>
+          </VisuallyHidden.Root>
+          <DialogHeader>
+            <DialogTitle className="text-xl text-destructive">
+              {tp.deleteConfirmTitle}
+            </DialogTitle>
+            <DialogDescription>{tp.deleteConfirmDescription}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="mt-4 flex-col-reverse sm:flex-row gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setDeleteDialogOpen(false)}
+              className="h-10 w-full sm:w-auto"
+            >
+              {tp.cancel}
+            </Button>
+            <Button variant="destructive" onClick={confirmDelete} className="h-10 w-full sm:w-auto">
+              {tp.delete}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <div className="fixed inset-x-4 bottom-4 z-40 sm:hidden">
+        <Button
+          onClick={() => setShowNewPromptDialog(true)}
+          className="h-11 w-full shadow-lg shadow-primary/20"
+        >
+          <PlusCircle className="mr-2 h-4 w-4" />
+          {tp.create}
+        </Button>
+      </div>
+      <NewPromptDialog
+        open={showNewPromptDialog}
+        onOpenChange={setShowNewPromptDialog}
+        prompt={newPrompt}
+        onFieldChange={updateNewPromptField}
+        onSubmit={handleCreatePrompt}
+        onCancel={() => setShowNewPromptDialog(false)}
+        isSubmitting={isSubmitting}
+        isOptimizing={isOptimizing}
+        onOptimize={handleOptimize}
+        tagOptions={tagOptions}
+        onCreateTag={handleCreateTag}
+        copy={tp}
+      />
+      <OnboardingDialog
+        open={showOnboardingDialog}
+        onOpenChange={handleOnboardingOpenChange}
+        copy={tp?.onboarding}
+        isImporting={isImportingConversation}
+        onApplyRole={handleApplyRoleTemplate}
+        onImportConversation={handleImportConversation}
+        onConversationInvalid={() => {
+          toast({
+            variant: "destructive",
+            description:
+              t?.promptsPage?.onboarding?.validationConversation ||
+              "请先粘贴至少 20 个字符的对话内容",
+            duration: 2000,
+          });
+        }}
+      />
+      <OptimizePromptDialog
+        open={showOptimizeModal}
+        onOpenChange={(open) => {
+          setShowOptimizeModal(open);
+          if (!open) {
+            setOptimizedContent("");
+          }
+        }}
+        copy={tp}
+        isOptimizing={isOptimizing}
+        optimizedContent={optimizedContent}
+        onChangeContent={setOptimizedContent}
+        onApply={applyOptimizedContent}
+        onCancel={() => {
+          setShowOptimizeModal(false);
+          setOptimizedContent("");
+        }}
+      />
+    </div>
+  </div>
+  );
+}
